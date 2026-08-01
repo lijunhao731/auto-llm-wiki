@@ -644,21 +644,22 @@ async function extractPptxSlideImageText(
   if (!imageOcrProvider) return [];
 
   const imagePaths = await getPptxSlideImagePaths(files, slidePath);
-  const texts: string[] = [];
-  for (let imageIndex = 0; imageIndex < imagePaths.length; imageIndex++) {
-    const imagePath = imagePaths[imageIndex];
+  // Submit every image's OCR concurrently so the caller's concurrency limiter (in main.ts) can
+  // cap the actual network parallelism. Sequential submission would force the limiter into
+  // single-flight mode and waste the configured budget.
+  const transcribed = await Promise.all(imagePaths.map(async (imagePath, imageIndex) => {
     const imageFile = files[imagePath];
     const mimeType = getPptxImageMimeType(imagePath);
-    if (!imageFile || !mimeType) continue;
+    if (!imageFile || !mimeType) return "";
 
     const imageDataUrl = `data:${mimeType};base64,${await imageFile.async("base64")}`;
     const text = (await imageOcrProvider({
       path: `${deckPath}#slide-${slideNumber}-image-${imageIndex + 1}`,
       imageDataUrl
     })).trim();
-    if (text) texts.push(text);
-  }
-  return texts;
+    return text;
+  }));
+  return transcribed.filter((text) => text.length > 0);
 }
 
 const pptxParser: RawParser = {
@@ -710,17 +711,29 @@ const pdfParser: RawParser = {
     const pdfJs = await loadPdfJs() as PdfJs;
     const data = new Uint8Array(await app.vault.readBinary(file));
     const document = await pdfJs.getDocument({ data }).promise;
-    const pages: string[] = [];
+    // First pass: pull text-layer content from every page synchronously. OCR is much slower than
+    // text extraction, so doing it serially would force the OCR limiter into single-flight mode.
+    // Collecting text first and OCR'ing blank pages in parallel (via Promise.all below) lets the
+    // limiter actually have N requests in flight when the PDF has multiple blank pages.
+    const pageData: Array<{ pageNumber: number; page: PdfPage; text: string }> = [];
     for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber++) {
       const page = await document.getPage(pageNumber);
       const textContent = await page.getTextContent();
       const pageText = textContent.items.map((item) => item.str ?? "").join(" ").trim();
-      if (pageText) {
-        pages.push(pageText);
-      } else if (context.pdfOcrProvider) {
-        const ocrText = (await context.pdfOcrProvider({ page, path: file.path, pageNumber })).trim();
-        if (ocrText) pages.push(ocrText);
-      }
+      pageData.push({ pageNumber, page, text: pageText });
+    }
+    // Second pass: OCR the blank pages in parallel. The caller-side limiter caps how many of
+    // these actually go over the wire at once; this just submits them concurrently so the cap
+    // can do its job.
+    const ocrTexts = await Promise.all(pageData.map(async (entry) => {
+      if (entry.text || !context.pdfOcrProvider) return "";
+      const ocrText = (await context.pdfOcrProvider({ page: entry.page, path: file.path, pageNumber: entry.pageNumber })).trim();
+      return ocrText;
+    }));
+    const pages: string[] = [];
+    for (let index = 0; index < pageData.length; index++) {
+      const text = pageData[index].text || ocrTexts[index];
+      if (text) pages.push(text);
     }
     const text = pages.join("\n\n");
     if (!text) throw new Error(t("error.noExtractablePdfText", { path: file.path }));

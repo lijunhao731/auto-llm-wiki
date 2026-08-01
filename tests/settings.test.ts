@@ -193,3 +193,103 @@ test("OpenAI connection test reports localized zh failure with raw provider deta
   expect(notices).toContain("OpenAI 连接测试失败：401 bad key");
   expect(button.disabled).toBe(false);
 });
+
+test("OCR settings default to a vision model and inherit-from-main fallback", () => {
+  expect(DEFAULT_SETTINGS.ocrApiUrl).toBe("");
+  expect(DEFAULT_SETTINGS.ocrApiKey).toBe("");
+  expect(DEFAULT_SETTINGS.ocrModel).toBe("");
+  expect(DEFAULT_SETTINGS.ocrTimeoutMs).toBe(0);
+  expect(DEFAULT_SETTINGS.ocrConcurrency).toBe(2);
+
+  const plugin = new (LLMWikiPlugin as unknown as { new(): LLMWikiPlugin })();
+  plugin.settings = {
+    ...DEFAULT_SETTINGS,
+    openAIApiUrl: "https://api.openai.com/v1/chat/completions",
+    openAIApiKey: "main-key",
+    openAIModel: "gpt-4.1-mini",
+    requestTimeoutMs: 900000
+  };
+  // Empty OCR overrides must fall back to the main OpenAI settings so legacy users
+  // do not have to reconfigure anything for OCR to keep working.
+  expect(plugin.getOcrSettings()).toEqual({
+    apiKey: "main-key",
+    apiUrl: "https://api.openai.com/v1/chat/completions",
+    model: "gpt-4.1-mini",
+    timeoutMs: 900000
+  });
+});
+
+test("getOcrSettings returns dedicated overrides when set", () => {
+  const plugin = new (LLMWikiPlugin as unknown as { new(): LLMWikiPlugin })();
+  plugin.settings = {
+    ...DEFAULT_SETTINGS,
+    openAIApiKey: "main-key",
+    openAIModel: "gpt-4.1-mini",
+    requestTimeoutMs: 900000,
+    ocrApiKey: "ocr-key",
+    ocrModel: "gpt-4o-mini",
+    ocrTimeoutMs: 60000
+  };
+  // URL falls back when empty, the rest overrides the main setting.
+  expect(plugin.getOcrSettings()).toEqual({
+    apiKey: "ocr-key",
+    apiUrl: DEFAULT_SETTINGS.openAIApiUrl,
+    model: "gpt-4o-mini",
+    timeoutMs: 60000
+  });
+});
+
+test("settings tab renders OCR controls and the test OCR connection button", () => {
+  const plugin = new (LLMWikiPlugin as unknown as { new(): LLMWikiPlugin })();
+  const tab = new LLMWikiSettingTab({} as never, plugin);
+
+  tab.display();
+
+  const texts = (tab.containerEl as unknown as { texts: string[] }).texts;
+  const buttons = (tab.containerEl as unknown as { buttons: Button[] }).buttons;
+  expect(texts).toContain("OCR");
+  expect(texts).toContain("OCR API URL");
+  expect(texts).toContain("OCR API key");
+  expect(texts).toContain("OCR model");
+  expect(texts).toContain("OCR concurrency");
+  expect(buttons.some((button) => button.buttonText === "Test OCR connection")).toBe(true);
+});
+
+test("OCR concurrency control rejects zero, fractions, and negative input", async () => {
+  const { plugin, inputs } = renderTextInputs();
+  const concurrency = inputs.find((input) => input.value === "2")!;
+  await concurrency.onchange!("0");
+  expect(plugin.settings.ocrConcurrency).toBe(2); // 0 rejected
+  await concurrency.onchange!("-3");
+  expect(plugin.settings.ocrConcurrency).toBe(2); // negative rejected
+  await concurrency.onchange!("8");
+  expect(plugin.settings.ocrConcurrency).toBe(8);
+  await concurrency.onchange!("4.7");
+  expect(plugin.settings.ocrConcurrency).toBe(4); // floored
+});
+
+test("OCR connection test reports success for the effective OCR endpoint and key", async () => {
+  jest.spyOn(obsidian, "requestUrl").mockResolvedValue({ status: 204, text: "" } as never);
+  const plugin = new (LLMWikiPlugin as unknown as { new(): LLMWikiPlugin })();
+  // ocrApiKey is set, openAIApiKey is not — verifies the test targets the OCR fields,
+  // not the main ones.
+  plugin.settings = {
+    ...DEFAULT_SETTINGS,
+    openAIApiUrl: "https://example.test/v1/chat/completions",
+    openAIApiKey: "main-key",
+    openAIModel: "main-model",
+    ocrApiKey: "ocr-key",
+    ocrModel: "ocr-model"
+  };
+  const tab = new LLMWikiSettingTab({} as never, plugin);
+
+  tab.display();
+  const button = (tab.containerEl as unknown as { buttons: Button[] }).buttons.find((candidate) => candidate.buttonText === "Test OCR connection")!;
+  await button.onclick!();
+
+  const request = (obsidian.requestUrl as jest.Mock).mock.calls[0][0];
+  expect(request.headers.Authorization).toBe("Bearer ocr-key");
+  expect(JSON.parse(request.body).model).toBe("ocr-model");
+  expect(notices).toContain("OpenAI connection test succeeded.");
+  expect(button.disabled).toBe(false);
+});

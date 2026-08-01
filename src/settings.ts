@@ -16,7 +16,16 @@ export const DEFAULT_SETTINGS: LLMWikiSettings = {
   autoIngestEnabled: false,
   autoIngestDebounceMs: 3000,
   autoIngestPollSeconds: 15,
-  requestTimeoutMs: 900000
+  requestTimeoutMs: 900000,
+  // OCR overrides default to "use the main OpenAI settings" (empty/0). This preserves behavior for
+  // existing users whose persisted plugin data has no OCR fields: their OCR continues to hit the
+  // same endpoint/key/model they already configured. Users who want a different OCR model (for
+  // example, a vision-tuned one) can fill the field in explicitly.
+  ocrApiUrl: "",
+  ocrApiKey: "",
+  ocrModel: "",
+  ocrTimeoutMs: 0,
+  ocrConcurrency: 2
 };
 
 export class LLMWikiSettingTab extends PluginSettingTab {
@@ -42,16 +51,26 @@ export class LLMWikiSettingTab extends PluginSettingTab {
     this.addTextSetting(t("settings.openAIModel.name"), t("settings.openAIModel.desc"), "openAIModel");
     this.addToggleSetting(t("settings.autoIngestEnabled.name"), t("settings.autoIngestEnabled.desc"), "autoIngestEnabled");
     // Debounce and timeout are stored in ms (factor 1000) but shown in seconds; poll is stored
-    // in seconds (factor 1). Timeout must be > 0; debounce and poll may be 0.
+    // in seconds (factor 1). Timeout must be > 0; debounce and poll may be 0. OCR timeout follows
+    // the same seconds-shown convention but is allowed to be 0 (= inherit the main timeout).
     this.addSecondsSetting("settings.autoIngestDebounce", "autoIngestDebounceMs", 1000, true);
     this.addSecondsSetting("settings.autoIngestPoll", "autoIngestPollSeconds", 1, true);
     this.addSecondsSetting("settings.requestTimeout", "requestTimeoutMs", 1000, false);
     this.addOpenAIConnectionTest();
+
+    // OCR section: independent config with fallback to the main OpenAI settings when empty.
+    new Setting(containerEl).setName(t("settings.ocrHeading.name")).setHeading();
+    this.addTextSetting(t("settings.ocrApiUrl.name"), t("settings.ocrApiUrl.desc"), "ocrApiUrl");
+    this.addTextSetting(t("settings.ocrApiKey.name"), t("settings.ocrApiKey.desc"), "ocrApiKey", true);
+    this.addTextSetting(t("settings.ocrModel.name"), t("settings.ocrModel.desc"), "ocrModel");
+    this.addSecondsSetting("settings.ocrTimeout", "ocrTimeoutMs", 1000, true);
+    this.addOcrConcurrencySetting();
+    this.addOcrConnectionTest();
   }
 
   private addSecondsSetting(
-    labelKey: "settings.autoIngestDebounce" | "settings.autoIngestPoll" | "settings.requestTimeout",
-    key: "autoIngestDebounceMs" | "autoIngestPollSeconds" | "requestTimeoutMs",
+    labelKey: "settings.autoIngestDebounce" | "settings.autoIngestPoll" | "settings.requestTimeout" | "settings.ocrTimeout",
+    key: "autoIngestDebounceMs" | "autoIngestPollSeconds" | "requestTimeoutMs" | "ocrTimeoutMs",
     factor: number,
     allowZero: boolean
   ): void {
@@ -82,6 +101,56 @@ export class LLMWikiSettingTab extends PluginSettingTab {
               apiKey: this.plugin.settings.openAIApiKey,
               apiUrl: this.plugin.settings.openAIApiUrl,
               model: this.plugin.settings.openAIModel
+            });
+            new Notice(t("notice.openAIConnectionSucceeded"));
+          } catch (error) {
+            const message = error instanceof OpenAIProviderError && error.kind === "connection"
+              ? error.message
+              : error instanceof Error
+                ? error.message
+                : t("error.unknown");
+            new Notice(t("notice.openAIConnectionFailed", { message }));
+          } finally {
+            button.setDisabled(false);
+          }
+        });
+      });
+  }
+
+  // OCR concurrency is an integer >= 1. We do not allow 0 here because the value drives a real
+  // semaphore; 0 would deadlock. The default in DEFAULT_SETTINGS is 2.
+  private addOcrConcurrencySetting(): void {
+    new Setting(this.containerEl)
+      .setName(t("settings.ocrConcurrency.name"))
+      .setDesc(t("settings.ocrConcurrency.desc"))
+      .addText((text) => {
+        text.setValue(String(this.plugin.settings.ocrConcurrency));
+        text.onChange(async (value) => {
+          const parsed = Number(value.trim());
+          if (!Number.isFinite(parsed) || parsed < 1) return;
+          const clamped = Math.floor(parsed);
+          this.plugin.settings = { ...this.plugin.settings, ocrConcurrency: clamped };
+          await this.plugin.saveSettings();
+        });
+      });
+  }
+
+  private addOcrConnectionTest(): void {
+    new Setting(this.containerEl)
+      .setName(t("settings.testOcrConnection.name"))
+      .setDesc(t("settings.testOcrConnection.desc"))
+      .addButton((button) => {
+        button.setButtonText(t("settings.testOcrConnection.name"));
+        button.onClick(async () => {
+          button.setDisabled(true);
+          try {
+            // Resolve the effective OCR settings through the plugin so the button tests exactly
+            // what OCR will use at ingest time (including the main-settings fallback).
+            const ocr = this.plugin.getOcrSettings();
+            await new OpenAIProvider(undefined, { timeoutMs: ocr.timeoutMs }).testConnection({
+              apiKey: ocr.apiKey,
+              apiUrl: ocr.apiUrl,
+              model: ocr.model
             });
             new Notice(t("notice.openAIConnectionSucceeded"));
           } catch (error) {

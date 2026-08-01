@@ -28,6 +28,12 @@ export default class LLMWikiPlugin extends Plugin implements ChatController {
   private autoIngestRunning = false;
   private autoIngestPending = false;
   private autoIngestPollTimer?: number;
+  // OCR concurrency limiter state. Reset at the start of each ingest run so a previous high
+  // setting does not leak into a later lower one; concurrent ingest runs would step on each
+  // other otherwise, so `runAutoIngest` is the gate.
+  private ocrLimiterActive = 0;
+  private readonly ocrLimiterWaiting: Array<() => void> = [];
+  private ocrLimiterLimit = 0;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -154,7 +160,7 @@ export default class LLMWikiPlugin extends Plugin implements ChatController {
         const message = t("status.extractingPdf", { path });
         this.setStatus(message);
         if (!quiet) new Notice(message);
-      }, (request) => this.ocrPdfPage(request), (request) => this.ocrImage(request));
+      }, (request) => this.runOcrWithLimit(() => this.ocrPdfPage(request)), (request) => this.runOcrWithLimit(() => this.ocrImage(request)));
       if (scan.failed.length > 0) {
         // Each message already names its file exactly once (see findChangedRawFiles).
         const details = scan.failed.map((failure) => failure.message).join("; ");
@@ -211,12 +217,13 @@ export default class LLMWikiPlugin extends Plugin implements ChatController {
     this.setStatus(message);
     new Notice(message);
     const imageDataUrl = await renderPdfPageToPngDataUrl(request.page);
-    const provider = this.createProvider();
+    const ocr = this.getOcrSettings();
+    const provider = new OpenAIProvider(undefined, { timeoutMs: ocr.timeoutMs });
     try {
       return await provider.completeVision({
-        apiKey: this.settings.openAIApiKey,
-        apiUrl: this.settings.openAIApiUrl,
-        model: this.settings.openAIModel,
+        apiKey: ocr.apiKey,
+        apiUrl: ocr.apiUrl,
+        model: ocr.model,
         prompt: t("prompt.ocrPdfPage", { pageNumber: request.pageNumber, path: request.path }),
         imageDataUrl
       });
@@ -229,17 +236,38 @@ export default class LLMWikiPlugin extends Plugin implements ChatController {
     const message = t("status.ocrImage", { path: request.path });
     this.setStatus(message);
     new Notice(message);
-    const provider = this.createProvider();
+    const ocr = this.getOcrSettings();
+    const provider = new OpenAIProvider(undefined, { timeoutMs: ocr.timeoutMs });
     try {
       return await provider.completeVision({
-        apiKey: this.settings.openAIApiKey,
-        apiUrl: this.settings.openAIApiUrl,
-        model: this.settings.openAIModel,
+        apiKey: ocr.apiKey,
+        apiUrl: ocr.apiUrl,
+        model: ocr.model,
         prompt: t("prompt.ocrImage", { path: request.path }),
         imageDataUrl: request.imageDataUrl
       });
     } catch (error) {
       throw new Error(formatOpenAIErrorMessage(error, t("error.requestFailed")));
+    }
+  }
+
+  // Bound the number of OCR requests that can be in flight at once. The limit is taken from the
+  // current settings on every call so changing the setting between ingest runs takes effect
+  // immediately. Submissions beyond the limit wait on a FIFO queue; the slot is released in a
+  // `finally` so an OCR failure cannot deadlock the limiter.
+  private async runOcrWithLimit<T>(work: () => Promise<T>): Promise<T> {
+    const limit = Math.max(1, Math.floor(this.settings.ocrConcurrency));
+    if (limit !== this.ocrLimiterLimit) this.ocrLimiterLimit = limit;
+    if (this.ocrLimiterActive >= limit) {
+      await new Promise<void>((resolve) => this.ocrLimiterWaiting.push(resolve));
+    }
+    this.ocrLimiterActive++;
+    try {
+      return await work();
+    } finally {
+      this.ocrLimiterActive--;
+      const next = this.ocrLimiterWaiting.shift();
+      if (next) next();
     }
   }
 
@@ -261,6 +289,18 @@ export default class LLMWikiPlugin extends Plugin implements ChatController {
 
   hasApiKey(): boolean {
     return Boolean(this.settings.openAIApiKey);
+  }
+
+  // Resolve the OCR settings actually used at call time. Empty OCR overrides fall back to the
+  // main OpenAI settings so existing users keep working without reconfiguring anything; the
+  // dedicated fields exist so vision-heavy ingest can be billed/scaled independently.
+  getOcrSettings(): { apiKey: string; apiUrl: string; model: string; timeoutMs: number } {
+    return {
+      apiKey: this.settings.ocrApiKey || this.settings.openAIApiKey,
+      apiUrl: this.settings.ocrApiUrl || this.settings.openAIApiUrl,
+      model: this.settings.ocrModel || this.settings.openAIModel,
+      timeoutMs: this.settings.ocrTimeoutMs > 0 ? this.settings.ocrTimeoutMs : this.settings.requestTimeoutMs
+    };
   }
 
   // ChatController: the conversation store lives in plugin data so it survives the leaf closing and

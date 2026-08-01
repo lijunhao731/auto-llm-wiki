@@ -23,6 +23,14 @@ export interface LLMWikiSettings {
   autoIngestDebounceMs: number;
   autoIngestPollSeconds: number;
   requestTimeoutMs: number;
+  // OCR-specific overrides. When a string/number is empty (or 0 for timeout), the corresponding
+  // main OpenAI setting is used so existing users do not have to reconfigure anything to keep
+  // OCR working; the dedicated fields exist so vision-heavy ingest can be billed/scaled separately.
+  ocrApiUrl: string;
+  ocrApiKey: string;
+  ocrModel: string;
+  ocrTimeoutMs: number;
+  ocrConcurrency: number;
 }
 
 export type FileOperationKind = "create" | "update" | "append" | "prepend" | "delete";

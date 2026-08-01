@@ -25,9 +25,13 @@ Auto LLM Wiki is an Obsidian plugin that maintains a Karpathy-style LLM Wiki. It
 
 `LLMProvider` interface defines `complete`, `completeVision`, `chat`, and `testConnection`. `OpenAIProvider` is the sole implementation — it uses Obsidian's `requestUrl` with retry logic (exponential backoff for 429/5xx, honors Retry-After), configurable timeout, and `temperature: 0.2`. Errors are typed as `OpenAIProviderError` with kinds: `connection`, `request`, `missing-content`, `invalid-json`, `truncated`, `timeout`. The `complete` method enforces strict JSON (rejects truncation); `completeVision` and `chat` are lenient.
 
+OCR calls use `LLMWikiPlugin.getOcrSettings()` which falls back to the main OpenAI settings when the dedicated OCR overrides are empty (or 0 for timeout) — so existing users keep working without reconfiguring anything. OCR providers are wrapped through `LLMWikiPlugin.runOcrWithLimit()` to cap in-flight OCR requests at `settings.ocrConcurrency`. OCR config is also independently testable from the settings tab.
+
 ### Document Parsing Pipeline (`src/rawParsers.ts` + `src/rawTracker.ts`)
 
 Parsers are registered as `RawParser` objects and loaded via dynamic `import()` to defer heavy dependencies. Supported formats: HTML, DOCX (mammoth), DOC (word-extractor), XLSX/XLS (@e965/xlsx), RTF (custom parser), PPT (ppt-to-text), PPTX (jszip), PDF (pdf.js with vision OCR fallback), images (vision OCR), and plain text/code.
+
+OCR calls inside the PDF and PPTX parsers are submitted concurrently (`Promise.all`) so the caller-side `ocrConcurrency` limiter in `LLMWikiPlugin.runOcrWithLimit` actually has N requests in flight. Sequential submission would force the limiter into single-flight mode and waste the configured budget.
 
 Change detection uses a three-tier strategy: mtime+size fast-path → binary hash for Office/PDF/images → content hash for text. Scanning runs with concurrency limits (4 for files, 8 for OpenXML entries). Per-file failures are isolated and do not abort the scan.
 

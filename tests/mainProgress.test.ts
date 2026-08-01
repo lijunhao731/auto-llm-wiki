@@ -429,3 +429,149 @@ test("runPrompt localizes invalid OpenAI JSON responses at the UI boundary", asy
   expect(plugin.statusBarItems[0].text).toBe("Auto LLM Wiki：错误 - OpenAI 响应不是 JSON。请检查 API URL；它应指向聊天补全端点。");
   expect(notices).toContain("OpenAI 响应不是 JSON。请检查 API URL；它应指向聊天补全端点。");
 });
+
+test("runOcrWithLimit caps in-flight OCR calls at ocrConcurrency", async () => {
+  const PluginMock = LLMWikiPlugin as unknown as { new(): LLMWikiPlugin };
+  const plugin = new PluginMock();
+  plugin.settings = { ...plugin.settings, ocrConcurrency: 2 };
+  const runWithLimit = (plugin as unknown as { runOcrWithLimit<T>(work: () => Promise<T>): Promise<T> }).runOcrWithLimit.bind(plugin);
+
+  let active = 0;
+  let peakActive = 0;
+  const work = async (): Promise<number> => {
+    active++;
+    peakActive = Math.max(peakActive, active);
+    // Yield several microtask ticks so concurrent submissions can pile up before we resolve.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    active--;
+    return active;
+  };
+
+  // Submit 6 tasks concurrently; with limit=2, peak active should never exceed 2.
+  await Promise.all(Array.from({ length: 6 }, () => runWithLimit(work)));
+
+  expect(peakActive).toBe(2);
+});
+
+test("runOcrWithLimit releases the slot when work throws so the queue does not deadlock", async () => {
+  const PluginMock = LLMWikiPlugin as unknown as { new(): LLMWikiPlugin };
+  const plugin = new PluginMock();
+  plugin.settings = { ...plugin.settings, ocrConcurrency: 1 };
+  const runWithLimit = (plugin as unknown as { runOcrWithLimit<T>(work: () => Promise<T>): Promise<T> }).runOcrWithLimit.bind(plugin);
+
+  const failing = runWithLimit(async () => { throw new Error("boom"); });
+  await expect(failing).rejects.toThrow("boom");
+
+  // After the failing call, the slot must be released so the next call can proceed.
+  const succeeding = runWithLimit(async () => "ok");
+  await expect(succeeding).resolves.toBe("ok");
+});
+
+test("OCR calls fall back to the main OpenAI settings when OCR overrides are empty", async () => {
+  const requestSpy = jest.spyOn(obsidian, "requestUrl").mockResolvedValue({
+    status: 200,
+    text: JSON.stringify({ choices: [{ message: { content: "{\"summary\":\"\",\"operations\":[]}" } }] })
+  } as never);
+  (globalThis as unknown as { document: { createElement(tag: string): unknown } }).document = {
+    createElement: () => ({
+      width: 0,
+      height: 0,
+      getContext: () => ({}),
+      toDataURL: () => "data:image/png;base64,abc"
+    })
+  };
+  jest.spyOn(obsidian, "loadPdfJs").mockResolvedValue({
+    getDocument: () => ({
+      promise: Promise.resolve({
+        numPages: 1,
+        getPage: async () => ({
+          getTextContent: async () => ({ items: [] }),
+          getViewport: () => ({ width: 1, height: 1 }),
+          render: () => ({ promise: Promise.resolve() })
+        })
+      })
+    })
+  });
+  const TFileMock = obsidian.TFile as unknown as { new(path: string): obsidian.TFile };
+  const PluginMock = LLMWikiPlugin as unknown as { new(): LLMWikiPlugin & { statusBarItems: Array<{ text: string }> } };
+  const plugin = new PluginMock();
+  // OCR fields all empty → the OCR call should hit the main endpoint/key/model.
+  jest.spyOn(plugin, "loadData").mockResolvedValue({
+    openAIApiUrl: "https://example.test/v1/chat/completions",
+    openAIApiKey: "main-key",
+    openAIModel: "main-model"
+  });
+  plugin.app = {
+    vault: {
+      getFiles: () => [new TFileMock("raw/scanned.pdf")],
+      readBinary: async () => new ArrayBuffer(4)
+    }
+  } as never;
+
+  await plugin.onload();
+  await (plugin as unknown as { ingestActiveSource(): Promise<void> }).ingestActiveSource();
+
+  const ocrCall = requestSpy.mock.calls.find((call) => {
+    const body = JSON.parse((call[0] as { body: string }).body);
+    return body.messages.some((message: { content: unknown }) => Array.isArray(message.content));
+  });
+  expect(ocrCall).toBeDefined();
+  expect((ocrCall![0] as { headers: Record<string, string> }).headers.Authorization).toBe("Bearer main-key");
+  expect(JSON.parse((ocrCall![0] as { body: string }).body).model).toBe("main-model");
+});
+
+test("OCR calls use the dedicated OCR settings when set, ignoring the main model", async () => {
+  const requestSpy = jest.spyOn(obsidian, "requestUrl").mockResolvedValue({
+    status: 200,
+    text: JSON.stringify({ choices: [{ message: { content: "{\"summary\":\"\",\"operations\":[]}" } }] })
+  } as never);
+  (globalThis as unknown as { document: { createElement(tag: string): unknown } }).document = {
+    createElement: () => ({
+      width: 0,
+      height: 0,
+      getContext: () => ({}),
+      toDataURL: () => "data:image/png;base64,abc"
+    })
+  };
+  jest.spyOn(obsidian, "loadPdfJs").mockResolvedValue({
+    getDocument: () => ({
+      promise: Promise.resolve({
+        numPages: 1,
+        getPage: async () => ({
+          getTextContent: async () => ({ items: [] }),
+          getViewport: () => ({ width: 1, height: 1 }),
+          render: () => ({ promise: Promise.resolve() })
+        })
+      })
+    })
+  });
+  const TFileMock = obsidian.TFile as unknown as { new(path: string): obsidian.TFile };
+  const PluginMock = LLMWikiPlugin as unknown as { new(): LLMWikiPlugin & { statusBarItems: Array<{ text: string }> } };
+  const plugin = new PluginMock();
+  jest.spyOn(plugin, "loadData").mockResolvedValue({
+    openAIApiUrl: "https://main.example/v1/chat/completions",
+    openAIApiKey: "main-key",
+    openAIModel: "main-model",
+    ocrApiUrl: "https://ocr.example/v1/chat/completions",
+    ocrApiKey: "ocr-key",
+    ocrModel: "gpt-4o"
+  });
+  plugin.app = {
+    vault: {
+      getFiles: () => [new TFileMock("raw/scanned.pdf")],
+      readBinary: async () => new ArrayBuffer(4)
+    }
+  } as never;
+
+  await plugin.onload();
+  await (plugin as unknown as { ingestActiveSource(): Promise<void> }).ingestActiveSource();
+
+  const ocrCall = requestSpy.mock.calls.find((call) => {
+    const body = JSON.parse((call[0] as { body: string }).body);
+    return body.messages.some((message: { content: unknown }) => Array.isArray(message.content));
+  });
+  expect(ocrCall).toBeDefined();
+  expect((ocrCall![0] as { url: string }).url).toBe("https://ocr.example/v1/chat/completions");
+  expect((ocrCall![0] as { headers: Record<string, string> }).headers.Authorization).toBe("Bearer ocr-key");
+  expect(JSON.parse((ocrCall![0] as { body: string }).body).model).toBe("gpt-4o");
+});
